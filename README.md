@@ -4,6 +4,18 @@ This is the start of the Mighty Synth Sampler Resources repo. Here you'll find l
 
 ---
 
+## Mighty Synth Sampler Videos
+
+The Story Behind Mighty Synth Sampler | FREE Synth & Sound Packs Demo
+https://youtu.be/3kW4RovVoEY
+
+Mighty Synth Sampler | Complete Guide 
+https://youtu.be/nmr73iCG4Ro
+
+How To Make Instruments in Mighty Synth Sampler + DMT Cymatics Presets Demo: 
+https://youtu.be/1xKJm4eavcM
+
+
 ## `convert_to_wv.py` Normalize and compress samples to WavPack
 
 A Python script that walks a folder of `.wav` files, peak-normalizes each one to 0 dB, then converts to WavPack (`.wv`) lossless compression. Useful when preparing sound packs for distribution, smaller files, no quality loss, and Mighty Synth Sampler auto-detects `.wv` files when present.
