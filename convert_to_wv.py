@@ -5,16 +5,26 @@ import tempfile
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 
+# Max seconds to allow any single subprocess call before giving up
+SUBPROCESS_TIMEOUT = 120
+
 # Path to wavpack tool — run `which wavpack` in Terminal to confirm your path.
 WAVPACK_PATH = '/usr/local/bin/wavpack'
 
 # WavPack compression flags
-WAVPACK_FLAGS = ['-q', '-r', '-b24']
+# Lossless compression by default. To use lossy compression and reduce file sizes,
+# add '-b<bitrate>' to the flags below (e.g. '-b160' for default lossy, '-b320' for high quality lossy).
+WAVPACK_FLAGS = ['-q', '-r']
 
-# Set to True to peak-normalize each WAV to 0 dB before converting.
-# When True, the script modifies your original .wav files in place during normalization.
-# When False, your .wav files are untouched and only the .wv versions are written.
+# Set to True to peak-normalize each audio file to 0 dB before converting.
+# When True, the script modifies your original audio files in place during normalization.
+# When False, your original files are untouched and only the .wv versions are written.
 NORMALIZE_BEFORE_CONVERT = False
+
+# Set to True to delete the original source audio file after a successful conversion.
+# Set to False to keep both the original and .wv side by side (Mighty Synth Sampler will
+# automatically prefer the .wv when both are present).
+DELETE_SOURCE_AFTER_CONVERT = False
 
 # Function to calculate the gain needed to normalize to 0 dB peak
 def calculate_gain(input_file):
@@ -30,7 +40,8 @@ def calculate_gain(input_file):
             ],
             stderr=subprocess.PIPE,
             text=True,
-            check=True
+            check=True,
+            timeout=SUBPROCESS_TIMEOUT,
         )
 
         # Search for the max_volume in the output
@@ -44,11 +55,14 @@ def calculate_gain(input_file):
             print(f"Could not determine max volume for {input_file}")
             return None
 
+    except subprocess.TimeoutExpired:
+        print(f"Timeout calculating gain for {input_file} — skipping")
+        return None
     except subprocess.CalledProcessError as e:
         print(f"Error calculating gain for {input_file}: {e.stderr}")
         return None
 
-# Function to normalize a single WAV file
+# Function to normalize a single audio file in place
 def normalize_audio_peak(input_file):
     try:
         # Calculate the required gain
@@ -66,7 +80,8 @@ def normalize_audio_peak(input_file):
         
         # Create a temporary file in the same directory as the input file
         dir_path = os.path.dirname(input_file)
-        with tempfile.NamedTemporaryFile(dir=dir_path, suffix='.wav', delete=False) as temp_file:
+        ext = os.path.splitext(input_file)[1]
+        with tempfile.NamedTemporaryFile(dir=dir_path, suffix=ext, delete=False) as temp_file:
             temp_output_file = temp_file.name
         
         # Use ffmpeg to normalize the audio
@@ -77,7 +92,8 @@ def normalize_audio_peak(input_file):
                 "-af", f"volume={gain}dB",
                 "-y",  # Overwrite output file
                 temp_output_file
-            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               timeout=SUBPROCESS_TIMEOUT)
             
             # Replace the original file with the normalized version
             os.replace(temp_output_file, input_file)
@@ -95,42 +111,69 @@ def normalize_audio_peak(input_file):
         print(f"Unexpected error processing {input_file}: {str(e)}")
         return input_file  # Return the original file path
 
-# Function to convert WAV to WV
+# Function to convert an audio file to WV
 def convert_to_wv(wav_path):
+    ext = os.path.splitext(wav_path)[1].lower()
+    temp_wav = None
     try:
         wv_path = os.path.splitext(wav_path)[0] + '.wv'
         print(f"Converting: {wav_path} → {wv_path}")
-        
+
+        # Decode to a temporary WAV if WavPack can't read the source format directly
+        if ext in FFMPEG_DECODE_EXTENSIONS:
+            dir_path = os.path.dirname(wav_path) or '.'
+            with tempfile.NamedTemporaryFile(dir=dir_path, suffix='.wav', delete=False) as tf:
+                temp_wav = tf.name
+            subprocess.run(
+                ["ffmpeg", "-i", wav_path, "-y", temp_wav],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=SUBPROCESS_TIMEOUT,
+            )
+            source = temp_wav
+        else:
+            source = wav_path
+
         # Run wavpack command
-        result = subprocess.run([WAVPACK_PATH] + WAVPACK_FLAGS + [wav_path],
+        result = subprocess.run([WAVPACK_PATH] + WAVPACK_FLAGS + [source],
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
                                text=True,
-                               check=True)
+                               check=True,
+                               timeout=SUBPROCESS_TIMEOUT)
+
+        # WavPack names the output after the source; rename to match the original if needed
+        if temp_wav:
+            temp_wv = os.path.splitext(temp_wav)[0] + '.wv'
+            if os.path.exists(temp_wv):
+                os.replace(temp_wv, wv_path)
         
         # Check if the WV file was created successfully
         if os.path.exists(wv_path):
             print(f"Successfully converted: {wv_path}")
-            # Uncomment the line below to also delete the original WAV file after a successful conversion.
-            # Leave commented to keep both the .wav and .wv side by side (Mighty Synth Sampler will
-            # automatically prefer the .wv when both are present).
-            # os.remove(wav_path)
+            if DELETE_SOURCE_AFTER_CONVERT:
+                os.remove(wav_path)
             return True
         else:
             print(f"Failed to create WV file: {wv_path}")
             return False
-            
+
+    except subprocess.TimeoutExpired:
+        print(f"Timeout converting {wav_path} — skipping")
+        return False
     except subprocess.CalledProcessError as e:
         print(f"Error converting {wav_path} to WV: {e.stderr}")
         return False
     except Exception as e:
         print(f"Unexpected error converting {wav_path}: {str(e)}")
         return False
+    finally:
+        if temp_wav and os.path.exists(temp_wav):
+            os.remove(temp_wav)
 
 # Function to process a single file (optionally normalize, then convert)
 def process_file(wav_path):
     try:
-        # Optionally peak-normalize the WAV file in place
+        # Optionally peak-normalize the audio file in place
         if NORMALIZE_BEFORE_CONVERT:
             path_to_convert = normalize_audio_peak(wav_path)
         else:
@@ -143,20 +186,28 @@ def process_file(wav_path):
     except Exception as e:
         print(f"Error processing {wav_path}: {str(e)}")
 
-# Function to process all WAV files in a directory and subdirectories
+# Extensions WavPack accepts as direct PCM input
+WAVPACK_NATIVE_EXTENSIONS = {'.wav', '.aif', '.aiff', '.w64', '.caf'}
+
+# Extensions that require ffmpeg decode to WAV before passing to WavPack
+FFMPEG_DECODE_EXTENSIONS = {'.flac'}
+
+SUPPORTED_EXTENSIONS = WAVPACK_NATIVE_EXTENSIONS | FFMPEG_DECODE_EXTENSIONS
+
+# Function to process all supported audio files in a directory and subdirectories
 def process_directory(directory, max_workers=4):
-    # Collect all WAV files
+    # Collect all supported audio files
     wav_files = []
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if file.lower().endswith('.wav'):
+            if os.path.splitext(file.lower())[1] in SUPPORTED_EXTENSIONS:
                 wav_files.append(os.path.join(root, file))
-    
+
     if not wav_files:
-        print(f"No WAV files found in {directory} or its subdirectories.")
+        print(f"No supported audio files found in {directory} or its subdirectories.")
         return
-    
-    print(f"Found {len(wav_files)} WAV files to process.")
+
+    print(f"Found {len(wav_files)} audio files to process.")
     
     # Process files in parallel
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
